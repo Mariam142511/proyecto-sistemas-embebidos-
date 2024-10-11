@@ -1,0 +1,7 @@
+videoFile = 'tu_video.avi'; 
+v = VideoReader(videoFile);
+
+while hasFrame(v)
+    frame = readFrame(v);
+    % Procesar cada fotograma aquí
+end
