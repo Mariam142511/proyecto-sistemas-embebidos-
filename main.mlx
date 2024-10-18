@@ -1,7 +1,157 @@
-videoFile = 'tu_video.avi'; 
-v = VideoReader(videoFile);
+clear;
+clc;
 
-while hasFrame(v)
-    frame = readFrame(v);
-    % Procesar cada fotograma aquí
+% Parámetros del entorno
+H = 1.99;  % Altura de la cámara en metros
+theta3 = deg2rad(40);  % Convertir a radianes
+theta1 = deg2rad(88);  % Convertir a radianes
+d1 = 1.40;
+d2 = 10;
+
+% Calcular la profundidad inicial del coche
+z = H / tan(theta3);  
+
+% Crear el detector de fondo con parámetros ajustados (GMM)
+foregroundDetector = vision.ForegroundDetector('NumGaussians', 4, ...
+    'NumTrainingFrames', 90, 'MinimumBackgroundRatio', 0.3, ...
+    'InitialVariance', 90*90);  % Ajuste de la sensibilidad
+
+% Leer el video
+videoReader = VideoReader("2560.mp4");
+
+% Inicialización de la estructura morfológica y otros parámetros
+seOpen = strel('square', 3);  % Estructura para apertura
+seClose = strel('square', 5); % Estructura para cierre
+blobAnalysis = vision.BlobAnalysis('BoundingBoxOutputPort', true, ...
+    'AreaOutputPort', false, 'CentroidOutputPort', true, ...
+    'MinimumBlobArea', 200); % Aumentar el área mínima para ignorar blobs pequeños
+
+% Parámetros para el cálculo de velocidad
+fps = videoReader.FrameRate;  
+pixel_to_meter_ratio = (d1 / d2);  % Relación ajustada usando d1 y d2
+moving_average_window = 20;  % Tamaño de la ventana de promedio móvil
+
+% Estructuras para almacenar los centroides y el historial de velocidades
+prevCentroids = [];  % Para almacenar los centroides anteriores
+objectSpeeds = containers.Map('KeyType', 'int32', 'ValueType', 'any');  % Mapa para almacenar velocidades por objeto
+
+% Inicializar una celda para almacenar los cuadros procesados
+processedFrames = {};
+
+% Definir la región de interés (ROI) [x, y, ancho, alto]
+roi = [0, 0, 1026, 700];  % Coordenadas y tamaño de la ROI
+
+% Bucle para procesar todo el video y almacenar los resultados
+while hasFrame(videoReader)
+    frame = readFrame(videoReader);  % Leer el siguiente cuadro
+    
+    % Recortar el cuadro a la región de interés
+    croppedFrame = imcrop(frame, roi);
+
+    % Convertir a escala de grises (opcional, según tu necesidad)
+    grayFrame = rgb2gray(croppedFrame); 
+    
+    % Aplicar filtro gaussiano para reducción de ruido
+    filteredFrame = imgaussfilt(grayFrame, 5);  % Ajusta sigma según sea necesario
+    
+    % Aplicar apertura morfológica para eliminar ruido
+    filteredFrame = imopen(filteredFrame, seOpen);
+
+    % Aplicar cierre morfológico para unir partes separadas
+    filteredFrame = imclose(filteredFrame, seClose);
+
+    % Detectar el primer plano en el cuadro filtrado
+    foreground = step(foregroundDetector, filteredFrame);
+
+    % Rellenar huecos en la imagen del primer plano
+    filteredForeground = imfill(foreground, 'holes');
+    filteredForeground = bwareaopen(filteredForeground, 2000);
+
+    % Aplicar dilatación morfológica para expandir las áreas detectadas
+    seDilate = strel('square', 9);  % Ajusta el tamaño según sea necesario
+    filteredForeground = imdilate(filteredForeground, seDilate);
+
+    % Detectar los componentes conectados (blobs) con el área mínima especificada
+    stats = regionprops(filteredForeground, 'Centroid', 'BoundingBox');
+    
+    % Crear una lista para almacenar los nuevos centroides
+    currentCentroids = reshape([stats.Centroid], 2, [])';
+    
+    % Si hay centroides detectados, asignarlos a los objetos
+    if ~isempty(currentCentroids)
+        if isempty(prevCentroids)
+            prevCentroids = currentCentroids;
+            for i = 1:size(currentCentroids, 1)
+                objectSpeeds(i) = zeros(1, moving_average_window);  % Inicializar velocidades con ceros
+            end
+        else
+            for i = 1:size(currentCentroids, 1)
+                % Buscar el objeto más cercano en el cuadro anterior
+                distances = sqrt(sum((prevCentroids - currentCentroids(i, :)).^2, 2));
+                [minDistance, closestIndex] = min(distances);
+
+                if minDistance < 50
+                    % Calcular la distancia en píxeles
+                    distance_pixels = minDistance;
+                    
+                    % Actualizar la relación píxeles a metros usando la profundidad 'z'
+                    depth_adjusted_pixel_to_meter_ratio = pixel_to_meter_ratio * (H / z);
+                    
+                    % Convertir la distancia de píxeles a metros ajustando por la profundidad
+                    distance_meters = distance_pixels * depth_adjusted_pixel_to_meter_ratio;
+                    
+                    % Calcular el tiempo entre cuadros
+                    time_per_frame = 1 / fps;
+                    
+                    % Calcular la velocidad en km/h
+                    speed_kmph = (distance_meters / time_per_frame) * 3.6;
+                    
+                    % Guardar la velocidad calculada en el historial del objeto
+                    speed_history = objectSpeeds(closestIndex);
+                    speed_history = [speed_history(2:end), speed_kmph];  % Añadir la nueva velocidad y eliminar la más antigua
+                    
+                    % Calcular el promedio móvil de la velocidad
+                    avg_speed_kmph = mean(speed_history);
+                    
+                    % Actualizar el historial de velocidades
+                    objectSpeeds(closestIndex) = speed_history;
+                else
+                    % Si no hay una coincidencia cercana, considerar que es un nuevo objeto
+                    closestIndex = size(prevCentroids, 1) + 1;
+                    objectSpeeds(closestIndex) = zeros(1, moving_average_window);  % Inicializar velocidad
+                    avg_speed_kmph = 0;
+                end
+
+                % Obtener la BoundingBox correspondiente al objeto
+                bbox = stats(i).BoundingBox;
+                
+                % Dibujar el cuadro delimitador (bounding box) alrededor del objeto detectado
+                croppedFrame = insertShape(croppedFrame, 'Rectangle', bbox, 'Color', 'green');
+                
+                % Mostrar la velocidad junto a la BoundingBox
+                speed_position = [bbox(1) + bbox(3), bbox(2)];  % Posición para el texto (al lado derecho de la BoundingBox)
+                croppedFrame = insertText(croppedFrame, speed_position, ...
+                    sprintf('Velocidad: %.2f km/h', avg_speed_kmph), ...
+                    'BoxOpacity', 1, 'FontSize', 24);
+            end
+        end
+        % Actualizar los centroides anteriores
+        prevCentroids = currentCentroids;
+    end
+
+    numCars = numel(stats);
+    croppedFrame = insertText(croppedFrame, [10 10], numCars, 'BoxOpacity', 1, 'FontSize', 14);
+
+    processedFrames{end+1} = croppedFrame; 
 end
+
+videoPlayer = vision.VideoPlayer('Name', 'Detected Cars');
+frameRate = videoReader.FrameRate;  
+frameDelay = 1 / frameRate;
+
+for i = 1:length(processedFrames)
+    step(videoPlayer, processedFrames{i});
+    pause(frameDelay);  
+end
+
+release(videoPlayer);
